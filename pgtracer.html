@@ -1,0 +1,534 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+		<title>PGTracer: un outil de tracing pour PostgreSQL</title>
+
+		<link rel="stylesheet" href="reveal/dist/reset.css">
+		<link rel="stylesheet" href="reveal/dist/reveal.css">
+		<link rel="stylesheet" href="reveal/dist/theme/solarized.css">
+
+		<!-- Theme used for syntax highlighted code -->
+		<link rel="stylesheet" href="reveal/plugin/highlight/monokai.css">
+		
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="pgtracer.css">
+
+    <!-- Embed asciinema -->
+    <link rel="stylesheet" type="text/css" href="asciinema/asciinema-player.css" />
+
+  </head>
+
+  <body>
+		<div class="reveal">
+      <div class="footer">
+        ronan.dunklau@aiven.io
+      </div>
+			<div class="slides">
+				<section data-background-image="images/aiven-logo_RGB.png"
+                 data-background-size="40%, contain"
+                 data-background-position="top right"
+          >
+          <h2>PGTracer</h2>
+          <h3>Un outil de tracing spécialisé pour PostgreSQL</h3>
+        </section>
+        <section data-markdown>
+          <textarea data-template>
+          ## À propos 
+
+          - Ronan Dunklau, developpeur open-source à Aiven
+          - Anciennement DBA
+          - Travaille dans l'écosystème PostgreSQL depuis plus de 10 ans
+          </textarea>
+        </section>
+        <section>
+          <h3>Un sondage !</h3>
+          Combien d'entre vous ont utilisé ...
+          <ul>
+            <li class="fragment"><code>pg_stat_statements</code></li>
+            <li class="fragment"><code>log_min_duration_statement</code></li>
+            <li class="fragment"><code>auto_explain</code></li>
+            <li class="fragment"><code>perf</code></li>
+          </ul>
+        </section>
+        <section data-markdown>
+          <textarea data-template>
+          ## Linux perf
+
+          - Pas besoin de configuration
+          - Collecte de données en direct
+          ![Perf](./images/screenshot_perfreport.png)
+          ---
+          ## Et si l'on pouvait...
+
+          - afficher l'ensemble des requêtes exécutée par un backend, en direct <!-- .element: class="fragment" -->
+          - activer l'instrumentation (métriques EXPLAIN ANALYZE) <!-- .element: class="fragment" -->
+          - afficher des plans d'exécution <!-- .element: class="fragment" -->
+          ---
+          ## Le cas d'utilisation de PGTracer
+          - Un backend a un problème
+          - Vous souhaitez investiguer, en direct, son comportement
+          ---
+          ## PGTracer
+          PGTracer est un outil utilisant les fonctionnalités du noyau Linux pour tracer PostgreSQL
+
+          Fonctionnalités:
+          - traçage des requêtes
+          - reconstruction des plans d'exécutions
+          - extractions des statistiques EXPLAIN
+          - extractions des statistiques OS
+          ---
+          ## PGTracer
+          ![Screenshot](./images/screenshot.png)
+          ---
+          ## PGTracer: mais comment ça marche ?
+
+          Basé sur eBPF, et les symboles de déboguage.
+          ---
+          ## eBPF
+
+          Extended Berkeley Packet Filtering
+
+          Une infrastructure fournie par le noyau (nécessite d'être root !)
+          ---
+          ## PGTracer et eBPF
+
+          Installation de tracepoints sur des appels de fonctions spécifiques:
+
+          - standard_ExecutorStart
+          - ExecutorFinish
+          - PortalDrop
+
+          Et bien d'autres...
+          ---
+          ## PGTracer et eBPF
+          Mais aussi, utilisation des perf-events pour exécuter du code en à une certaine fréquence d'échantillonage.
+
+          - Collecte de piles d'exécutions
+          - Mécanisme de publication / subscription pour lire la mémoire
+
+          ---
+          ## Usage d'eBPF
+          exemple
+          ```
+int portaldrop_return(struct pt_regs *ctx)
+{
+	struct portal_data_t *event;
+	struct portal_key_t key = {0};
+	event = event_ring.ringbuf_reserve(sizeof(struct portal_data_t));
+	if (!event)
+		return 1;
+	init_portal_data(event);
+	event->event_type = EventTypeDropPortalReturn;
+	event->portal_key = key;
+	event_ring.ringbuf_submit(event, 0);
+	return 0;
+}
+          ```
+          ---
+          ## Usage d'eBPF
+
+
+          Les tracepoints envoient des évènements au code résidant en espace utilisateur,
+          et lit des adresses mémoires spécifiques:
+          - données d'instrumentation
+          - texte de la requête
+          - des GUCs
+          - information sur les appels systèmes
+
+          Peut aussi écrire dans la mémoire du backend !
+          ---
+          ## Usage d'eBPF
+
+          Des sondes peuvent aussi être positionnées dans le kernel
+
+          Ex: block_rq_issue
+
+          ---
+          ## Usage d'eBPF
+          exemple
+          ```
+TRACEPOINT_PROBE(block, block_rq_issue)
+{
+	struct io_req_data_t *event;
+	if (bpf_get_current_pid_tgid() >> 32 != PID)
+		return 1;
+	event = event_ring.ringbuf_reserve(sizeof(struct io_req_data_t));
+	if (!event)
+		return 1;
+	event->event_type = EventTypeKBlockRqIssue;
+	event->bytes = args->nr_sector << 9;
+    if (event->bytes == 0) {
+        event->bytes = args->bytes;
+    }
+	bpf_probe_read(&event->rwbs, sizeof(event->rwbs), args->rwbs);
+	event_ring.ringbuf_submit(event, 0);
+    return 0;
+}
+```
+
+
+          ---
+          ## Usage d'eBPF
+
+          ![PGTracer architecture](./images/arch.png)
+
+          ---
+          ## Comment accèder à la mémoire ?
+
+          Le code eBPF n'a pas accès aux headers de Postgres.
+          L'accès mémoire est dynamique: calcul de décalages à partir de l'adresse de base du programme.
+          DWARF à la rescousse !
+          <!-- Insert picture of a dwarf -->
+          ![DWARF](./images/dwarf_logo.gif)
+          ---
+          ## DWARF
+
+          DWARF est le standard pour les informations de debugs
+          - emplacement des variables globales
+          - définitions de types, de fonctions
+          - information sur la pile d'exécution
+          ---
+          ## DWARF: exemple
+          ```
+          0x011a138a:   DW_TAG_structure_type
+                DW_AT_name      ("Instrumentation")
+                DW_AT_byte_size (0x0180)
+                DW_AT_decl_file ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                DW_AT_decl_line (64)
+                DW_AT_decl_column       (0x10)
+                DW_AT_sibling   (0x011a149e)
+
+0x011a1398:     DW_TAG_member
+                  DW_AT_name    ("need_timer")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (67)
+                  DW_AT_decl_column     (0x08)
+                  DW_AT_type    (0x0119eaf7 "_Bool")
+                  DW_AT_data_member_location    (0x00)
+
+0x011a13a5:     DW_TAG_member
+                  DW_AT_name    ("need_bufusage")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (68)
+                  DW_AT_decl_column     (0x08)
+                  DW_AT_type    (0x0119eaf7 "_Bool")
+                  DW_AT_data_member_location    (0x01)
+
+0x011a13b2:     DW_TAG_member
+                  DW_AT_name    ("need_walusage")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (69)
+                  DW_AT_decl_column     (0x08)
+                  DW_AT_type    (0x0119eaf7 "_Bool")
+                  DW_AT_data_member_location    (0x02)
+
+0x011a13bf:     DW_TAG_member
+                  DW_AT_name    ("async_mode")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (70)
+                  DW_AT_decl_column     (0x08)
+                  DW_AT_type    (0x0119eaf7 "_Bool")
+                  DW_AT_data_member_location    (0x03)
+
+0x011a13cc:     DW_TAG_member
+                  DW_AT_name    ("running")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (72)
+                  DW_AT_decl_column     (0x08)
+                  DW_AT_type    (0x0119eaf7 "_Bool")
+                  DW_AT_data_member_location    (0x04)
+
+0x011a13d9:     DW_TAG_member
+                  DW_AT_name    ("starttime")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (73)
+                  DW_AT_decl_column     (0x0d)
+                  DW_AT_type    (0x011a1287 "instr_time")
+                  DW_AT_data_member_location    (0x08)
+
+0x011a13e6:     DW_TAG_member
+                  DW_AT_name    ("counter")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (74)
+                  DW_AT_decl_column     (0x0d)
+                  DW_AT_type    (0x011a1287 "instr_time")
+                  DW_AT_data_member_location    (0x18)
+
+0x011a13f3:     DW_TAG_member
+                  DW_AT_name    ("firsttuple")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (75)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0x28)
+
+0x011a1400:     DW_TAG_member
+                  DW_AT_name    ("tuplecount")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (76)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0x30)
+
+0x011a140d:     DW_TAG_member
+                  DW_AT_name    ("bufusage_start")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (77)
+                  DW_AT_decl_column     (0x0e)
+                  DW_AT_type    (0x011a133d "BufferUsage")
+                  DW_AT_data_member_location    (0x38)
+
+0x011a141a:     DW_TAG_member
+                  DW_AT_name    ("walusage_start")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (78)
+                  DW_AT_decl_column     (0x0b)
+                  DW_AT_type    (0x011a137e "WalUsage")
+                  DW_AT_data_member_location    (0xa8)
+
+0x011a1427:     DW_TAG_member
+                  DW_AT_name    ("startup")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (80)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xc0)
+
+0x011a1434:     DW_TAG_member
+                  DW_AT_name    ("total")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (81)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xc8)
+
+0x011a1441:     DW_TAG_member
+                  DW_AT_name    ("ntuples")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (82)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xd0)
+
+0x011a144e:     DW_TAG_member
+                  DW_AT_name    ("ntuples2")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (83)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xd8)
+
+0x011a145b:     DW_TAG_member
+                  DW_AT_name    ("nloops")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (84)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xe0)
+
+0x011a1468:     DW_TAG_member
+                  DW_AT_name    ("nfiltered1")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (85)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xe8)
+
+0x011a1475:     DW_TAG_member
+                  DW_AT_name    ("nfiltered2")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (86)
+                  DW_AT_decl_column     (0x0a)
+                  DW_AT_type    (0x0119e725 "double")
+                  DW_AT_data_member_location    (0xf0)
+
+0x011a1482:     DW_TAG_member
+                  DW_AT_name    ("bufusage")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (87)
+                  DW_AT_decl_column     (0x0e)
+                  DW_AT_type    (0x011a133d "BufferUsage")
+                  DW_AT_data_member_location    (0xf8)
+
+0x011a148f:     DW_TAG_member
+                  DW_AT_name    ("walusage")
+                  DW_AT_decl_file       ("/home/ro/dev/postgresql/src/backend/utils/mmgr/../../../../src/include/executor/instrument.h")
+                  DW_AT_decl_line       (88)
+                  DW_AT_decl_column     (0x0b)
+                  DW_AT_type    (0x011a137e "WalUsage")
+                  DW_AT_data_member_location    (0x0168)
+          ```
+          ---
+          ## DWARF
+          - le code eBPF lit de la mémoire
+          - l'envoie à l'espace utilisateur
+          - le code utilisateur l'interprète à l'aide des informations DWARF (par exemple, le champ est à la position X)
+          ---
+          ## Comment capturer les données de nœuds individuels ?
+          - Les nœuds du plan sont complexes, le code eBPF ne peut pas les connaître
+          - S'attacher à ExecProcNode serait trop cher
+          - Solution: s'attacher au début et la fin de chaque nœud, capturant le type et l'instrumentation
+          - Mais comment reconstruire l'arbre ?
+          ---
+          ## Reconstituer un plan d'exécution
+          - En plus des données d'un nœud, on capture la pile entière.
+          - On déroule la pile pour trouver des fonctions "intéressantes"
+          - Récupérer les arguments à ce niveau de la pile
+          - Et enfin, reconstruction de l'arbre !
+          </textarea>
+        </section>
+        <section>
+          <h3> Reconstitution d'un plan: exemple (1/4)</h3>
+          <div>
+            <pre>
+          <code data-trim data-noescape>
+postgres=# explain (analyze, buffers) select * from t1 join t2 on t1.a = t2.a; 
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.43..64.78 rows=1997 width=21) (actual time=0.038..0.039 rows=0 loops=1)
+   Buffers: shared hit=7
+   ->  Seq Scan on t1  (cost=0.00..1.02 rows=2 width=8) (actual time=0.006..0.007 rows=2 loops=1)
+         Buffers: shared hit=1
+   ->  Index Only Scan using t2_a_idx on t2  (cost=0.43..21.90 rows=998 width=13) (actual time=0.008..0.008 rows=0 loops=2)
+         Index Cond: (a = t1.a)
+         Heap Fetches: 0
+         Buffers: shared hit=6
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.337 ms
+ Execution Time: 0.141 ms
+(12 rows)
+            </code>
+            </pre>
+          </div>
+        </section>
+        <section>
+          <h3> Reconstitution d'un plan: exemple (2/4)</h3>
+          <pre>
+          <code class="fragment" data-line-numbers="1">ExecProcNodeFirst Arg1: 0x560b6eb184b8
+ExecutePlan
+standard_ExecutorRun Arg1: 0x560b6eb28418
+ExplainOnePlan Arg1: 0x560b6eb184b8
+ExplainOneQuery Arg1: 0x560b6eb184b8
+ExplainQuery Arg1: 0x560b6eb184b8
+standard_ProcessUtility Arg1: 0x560b6ea5c138
+ProcessUtility Arg1: 0x7fffcb4f4350
+PortalRunUtility Arg1: 0x560b6eaa16a0
+FillPortalStore Arg1: 0x560b6eaa16a0
+PortalRun Arg1: 0x560b6eaa16a0
+exec_simple_query Arg1: 0x560b6eb184b8
+PostgresMain Arg1: 0x560b6eb184b8
+          </code>
+          </pre>
+          <pre>
+          <code class="fragment">
+ NestLoop (@0x560b6eb184b8)
+          </code>
+          </pre>
+        </section>
+        <section>
+          <h3> Reconstitution d'un plan: exemple (3/4)</h3>
+          <pre>
+          <code class="fragment" data-line-numbers="1,4">ExecProcNodeFirst Arg1: 0x560b6eb18690
+ExecProcNode Arg1: 0x560b6eb18690
+ExecNestLoop Arg1: 0x560b6eb18690
+ExecProcNodeInstr Arg1: 0x560b6eb184b8
+ExecutePlan
+standard_ExecutorRun Arg1: 0x560b6eb28418
+ExplainOnePlan Arg1: 0x560b6eb18690
+ExplainOneQuery Arg1: 0x560b6eb18690
+...
+          </code>
+          </pre>
+          <pre>
+          <code class="fragment">
+SeqScan (@0x560b6eb18690) (cost=0.00..1.02 rows=2 width=8) (actual time=0.000...0.000 rows=0 loops=0)
+          </code>
+          </pre>
+          <pre>
+          <code class="fragment">
+NestLoop (@0x560b6eb184b8) (cost=0.43..64.78 rows=1997 width=21) (actual time=0.000...0.000 rows=0 loops=0)
+        -> SeqScan (@0x560b6eb18690) (cost=0.00..1.02 rows=2 width=8) (actual time=0.000...0.000 rows=0 loops=0)
+          </code>
+          </pre>
+        </section>
+        <section>
+          <h3> Rebuilding execution plans: exemple (3/4)</h3>
+          Et enfin, on reconstruit l'ensemble...
+          <pre>
+          <code>
+NestLoop (cost=0.43..64.78 rows=1997 width=21) (actual time=0.033...0.034 rows=0 loops=1)
+        Buffers: shared_blks_hit=7
+        -> SeqScan (cost=0.00..1.02 rows=2 width=8) (actual time=0.005...0.006 rows=2 loops=1)
+                Buffers: shared_blks_hit=1
+        -> IndexOnlyScan (cost=0.43..21.90 rows=998 width=13) (actual time=0.004...0.004 rows=0 loops=2)
+                Buffers: shared_blks_hit=6
+          </code>
+          </pre>
+        </section>
+        <section>
+          <div class="asciicast">
+            <!--
+              {
+                "URL": "./asciinema/demo.cast"
+              }
+            -->
+          </div>
+        </section>
+        <section data-markdown>
+          <textarea data-template>
+            ## Ce qu'on pourrait ajouter à Postgres
+            - Plus de tracepoint statiques
+            - Rendre l'investigation de la mémoire plus facile: par exemple en stockant des variables globales pour le nœud d'exécution courant
+            ---
+            ## S'amuser avec eBPF
+            - On a besoin de CAP_SYSADMIN (en pratique, root...) La cap CAP_EBPF n'est pas utile pour le tracing.
+            - Le vérificateur eBPF est contraignant, et pas toujours explicite
+            - Les infos de debug DWARF ne sont pas les plus évidentes
+            - Pointeurs de frame à la rescousse ?
+            ---
+            ## Et la suite ?
+            - Ajouter des fonctionnalités pour rendre l'outil plus intéressant (traçage de la mémoire, des verrous)
+            - Corréler les informations systèmes avec les nœuds individuels
+            ---
+            ## Questions ?
+
+            Visitez https://github.com/aiven/pgtracer et essayez le !
+          </textarea>
+        </section>
+
+			</div>
+		</div>
+
+
+		<script src="reveal/dist/reveal.js"></script>
+		<script src="reveal/plugin/notes/notes.js"></script>
+		<script src="reveal/plugin/markdown/markdown.js"></script>
+		<script src="reveal/plugin/highlight/highlight.js"></script>
+    <script src="reveal/plugin/anything/plugin.js"></script>
+    <script src="asciinema/asciinema-player.min.js"></script>
+		<script>
+			// More info about initialization & config:
+			// - https://revealjs.com/initialization/
+			// - https://revealjs.com/config/
+			Reveal.initialize({
+				hash: true,
+        anything: [
+          {
+            className: "asciicast",
+            defaults: { theme: "monokai"},
+            initialize: (function(container, options) {
+              AsciinemaPlayer.create(options.URL, container, options);
+            })
+          }
+        ],
+				// Learn about plugins: https://revealjs.com/plugins/
+				plugins: [ RevealMarkdown, RevealHighlight, RevealNotes, RevealAnything ]
+			});
+		</script>
+
+  </body>
+</html>
